@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"context"
 	"crypto/rand"
 	"flag"
 	"fmt"
@@ -11,7 +10,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
-	"strings"
 	"time"
 
 	vhost "github.com/inconshreveable/go-vhost"
@@ -20,10 +18,11 @@ import (
 
 func main() {
 	var port = flag.String("p", "8080", "server port to use")
-	var host = flag.String("h", "128.199.23.60", "server hostname to use")
-	var addr = flag.String("b", "127.0.0.1", "ip to bind [server only]")
+	var host = flag.String("h", "priyankishore.dev", "server hostname to use")
+	var addr = flag.String("b", "0.0.0.0", "ip to bind [server only]")
 	flag.Parse()
 
+	//client code
 	if flag.Arg(0) != "" {
 		conn, err := net.Dial("tcp", net.JoinHostPort(*host, *port))
 		fatal(err)
@@ -53,7 +52,7 @@ func main() {
 	vmux, err := vhost.NewHTTPMuxer(l, 1*time.Second)
 	fatal(err)
 
-	go serve(vmux, *host, *port)
+	go serve(vmux, *host, *port, "8081")
 
 	log.Printf("gotunnel server [%s] ready!\n", *host)
 	for {
@@ -91,37 +90,46 @@ func fatal(err error) {
 	}
 }
 
-func serve(vmux *vhost.HTTPMuxer, host, port string) {
+func serve(vmux *vhost.HTTPMuxer, host, port string, forwardPort string) {
 	ml, err := vmux.Listen(net.JoinHostPort(host, port))
 	fatal(err)
 	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		publicHost := strings.TrimSuffix(net.JoinHostPort(newSubdomain()+host, port), ":80")
-		pl, err := vmux.Listen(publicHost)
-		fatal(err)
-		w.Header().Add("X-Public-Host", publicHost)
-		w.Header().Add("Connection", "close")
-		w.WriteHeader(http.StatusOK)
-		conn, _, _ := w.(http.Hijacker).Hijack()
-		sess := session.New(conn)
-		defer sess.Close()
-		log.Printf("%s: start session", publicHost)
-		go func() {
-			for {
-				conn, err := pl.Accept()
-				if err != nil {
-					log.Println(err)
-					return
-				}
-				ch, err := sess.Open(context.Background())
-				if err != nil {
-					log.Println(err)
-					return
-				}
-				go join(ch, conn)
-			}
-		}()
-		sess.Wait()
-		log.Printf("%s: end session", publicHost)
+		forwardAddr := net.JoinHostPort(host, forwardPort)
+
+		forwardConn, err := net.Dial("tcp", forwardAddr)
+		if err != nil {
+			log.Println("Failed to connect to forward port:", err)
+			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+			return
+		}
+		defer forwardConn.Close()
+
+		err = r.Write(forwardConn)
+		if err != nil {
+			log.Println("Failed to write request to forward port:", err)
+			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+			return
+		}
+
+		resp, err := http.ReadResponse(bufio.NewReader(forwardConn), r)
+		if err != nil {
+			log.Println("Failed to read response from forward port:", err)
+			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+			return
+		}
+		defer resp.Body.Close()
+
+		copyHeader(w.Header(), resp.Header)
+		w.WriteHeader(resp.StatusCode)
+		io.Copy(w, resp.Body)
 	})}
 	srv.Serve(ml)
+}
+
+func copyHeader(dst, src http.Header) {
+	for k, vv := range src {
+		for _, v := range vv {
+			dst.Add(k, v)
+		}
+	}
 }
